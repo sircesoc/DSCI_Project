@@ -1,6 +1,27 @@
 dataset:
   repo_id: repo_foldflow
   root: /media/sircesoc/WD_BLACK/lehome/dataset_challenge_merged/top_long_merged
+  image_transforms:
+    enable: true
+    max_num_transforms: 3
+    random_order: true
+    tfs:
+      brightness:
+        type: ColorJitter
+        weight: 1.0
+        kwargs:
+          brightness: [0.8, 1.2]
+      contrast:
+        type: ColorJitter
+        weight: 1.0
+        kwargs:
+          contrast: [0.8, 1.2]
+      affine:
+        type: RandomAffine
+        weight: 1.0
+        kwargs:
+          degrees: [-5.0, 5.0]
+          translate: [0.05, 0.05]
 
 policy:
   type: foldflow
@@ -50,15 +71,15 @@ policy:
   num_flow_steps: 10
   sigma_min: 0.0001
 
-  # Optimizer
+  # Optimizer — longer warmup to match the larger batch size
   optimizer_lr: 0.0001
   optimizer_betas: [0.95, 0.999]
   optimizer_weight_decay: 0.00001
-  scheduler_warmup_steps: 500
+  scheduler_warmup_steps: 1000
 
-output_dir: outputs/train/foldflow
-batch_size: 16
-steps: 50000
+output_dir: outputs/train/foldflow_v2
+batch_size: 32
+steps: 100000
 save_freq: 5000
 log_freq: 500
 
