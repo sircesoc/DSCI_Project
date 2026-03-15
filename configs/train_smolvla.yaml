@@ -1,6 +1,6 @@
 dataset:
   repo_id: repo_smolvla
-  root: Datasets/example/top_long_merged
+  root: /media/sircesoc/WD_BLACK/lehome/dataset_challenge_merged/top_long_merged
 
 policy:
   type: smolvla
@@ -26,7 +26,7 @@ policy:
       type: ACTION
       shape: [12]
 
-output_dir: outputs/train/smolvla_top_long
+output_dir: /media/sircesoc/WD_BLACK/lehome/outputs/train/smolvla_top_long
 batch_size: 32
 steps: 30000
 save_freq: 5000

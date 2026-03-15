@@ -1,6 +1,10 @@
-import torch
-import numpy as np
+import sys
+from importlib import import_module
+from pathlib import Path
 from typing import Dict, Any, Optional, Set, Union
+
+import numpy as np
+import torch
 from torch import Tensor
 
 from lerobot.configs.policies import PreTrainedConfig
@@ -14,6 +18,21 @@ from .base_policy import BasePolicy
 from .registry import PolicyRegistry
 
 logger = get_logger(__name__)
+
+
+def _register_local_policy_configs() -> None:
+    """Import local policy packages so custom LeRobot configs register themselves."""
+    module_name = "lerobot_policy_foldflow"
+    try:
+        import_module(module_name)
+        return
+    except ModuleNotFoundError:
+        package_src = (
+            Path(__file__).resolve().parents[2] / "lerobot_policy_foldflow" / "src"
+        )
+        if package_src.is_dir():
+            sys.path.insert(0, str(package_src))
+            import_module(module_name)
 
 
 @PolicyRegistry.register("lerobot")
@@ -55,6 +74,7 @@ class LeRobotPolicy(BasePolicy):
         meta = LeRobotDatasetMetadata(repo_id="lehome", root=dataset_root)
         
         # 2. Load Policy Config
+        _register_local_policy_configs()
         policy_cfg = PreTrainedConfig.from_pretrained(policy_path, cli_overrides={})
         policy_cfg.pretrained_path = policy_path
         

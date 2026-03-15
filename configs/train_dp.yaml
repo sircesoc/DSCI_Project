@@ -1,6 +1,6 @@
 dataset:
   repo_id: repo_dp
-  root: Datasets/example/top_long_merged
+  root: /media/sircesoc/WD_BLACK/lehome/dataset_challenge_merged/top_long_merged
 
 policy:
   type: diffusion
