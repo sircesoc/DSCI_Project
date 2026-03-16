@@ -40,7 +40,7 @@ The model predicts a 32-step action horizon and executes the first 16 actions be
 
 - **LeHome Simulation Challenge:** https://lehome-challenge.com/simulation-challenge  
 - **LeHome Training Guide:** [docs/training.md](docs/training.md)  
-- **GitHub Repository:** [add your repo link here]  
+- **GitHub Repository:** https://github.com/sircesoc/DSCI_Project  
 
 ---
 
