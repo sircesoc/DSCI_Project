@@ -1,0 +1,47 @@
+# Keypoint head training config — trains only GarmentKeypointHead (frozen backbone).
+#
+# Requirements:
+#   - Dataset collected with --record_keypoints flag (observation.keypoints present)
+#   - FoldFlow checkpoint path set in pretrained_backbone_path below
+#
+# Usage:
+#   python scripts/train_keypoint_head.py --config configs/train_keypoint.yaml
+
+dataset:
+  repo_id: repo_foldflow_keypoints
+  root: /media/sircesoc/WD_BLACK/lehome/dataset_challenge_merged/top_long_keypoints
+
+keypoint_head:
+  in_channels: 512     # ResNet18 output channels
+  n_keypoints: 6       # sleeve tips (0,1), shoulders (2,3), hem corners (4,5)
+
+training:
+  steps: 5000
+  batch_size: 32
+  lr: 5.0e-4
+  weight_decay: 1.0e-5
+  log_freq: 100
+  save_freq: 1000
+  output_dir: outputs/train/keypoint_head
+
+# Path to pre-trained FoldFlow checkpoint — backbone weights are loaded from here.
+# The backbone is FROZEN during keypoint head training.
+pretrained_foldflow_path: outputs/train/foldflow/checkpoints/last
+
+# Camera / projection parameters (top camera)
+camera:
+  fx: 482.0
+  fy: 482.0
+  cx: 320.0
+  cy: 240.0
+  img_w: 640
+  img_h: 480
+
+# Transforms for world → top camera (must match dataset_record.py projection)
+transforms:
+  # World → RobotBase
+  R_world_to_robot: [[-1, 0, 0], [0, -1, 0], [0, 0, 1]]
+  t_world_to_robot: [0.23, -0.25, 0.5]
+  # RobotBase → Camera (R_mix = R_usd @ R_opt)
+  cam_quat_usd: [-0.9862856, 0.0, 0.0, 0.1650476]  # xyzw
+  t_robot_to_cam: [0.225, -0.5, 0.6]
