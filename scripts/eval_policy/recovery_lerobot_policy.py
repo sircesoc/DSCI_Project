@@ -1,20 +1,15 @@
 """
 RecoveryLeRobotPolicy
 =====================
-Extends LeRobotPolicy with phase-aware retry logic for clothes folding.
+Extends LeRobotPolicy with a 5-state drop-recovery machine for clothes folding.
 
-Problem
--------
-FoldFlow (and any imitation policy) plans a 32-step action chunk that implicitly
-assumes earlier phases succeeded. If the first sleeve fold fails, the policy keeps
-advancing into the second-sleeve phase even though the garment is still unfolded.
-
-Solution
---------
-Track folding phases by monitoring gripper open→close→open cycles in the robot
-state. Each complete grasp-release cycle = one fold phase completed. If a phase
-runs too long without a detected cycle (timeout), force a re-plan from the current
-observation so the policy retries that phase from scratch.
+State machine
+-------------
+NORMAL       → run FoldFlow, watch DropDetector
+DROP_DETECTED→ localise garment, start MPPI pickup
+PICKUP       → drain MPPI actions one per step
+REENTRY      → SDEdit-corrected action chunk pushed to queue
+FALLBACK     → full re-plan from scratch (localization failed)
 
 Registration
 ------------
@@ -22,33 +17,43 @@ Registered as "lerobot_recovery" in the policy registry.
 Use --policy_type lerobot_recovery when calling eval.py.
 """
 
+from __future__ import annotations
+
+from enum import Enum, auto
 from typing import Dict
 
 import numpy as np
+import torch
 
 from lehome.utils.logger import get_logger
 from .lerobot_policy import LeRobotPolicy
 from .registry import PolicyRegistry
+from .drop_recovery import DropDetector, KeypointGarmentLocalizer, MPPIPickupPrimitive
 
 logger = get_logger(__name__)
 
 
 # --------------------------------------------------------------------------
-# Gripper cycle detector
+# State enum
+# --------------------------------------------------------------------------
+
+class _State(Enum):
+    NORMAL = auto()
+    DROP_DETECTED = auto()
+    PICKUP = auto()
+    REENTRY = auto()
+    FALLBACK = auto()
+
+
+# --------------------------------------------------------------------------
+# GripperCycleDetector (kept for phase tracking)
 # --------------------------------------------------------------------------
 
 class GripperCycleDetector:
     """Detects a full grasp-release cycle on a single gripper.
 
     A cycle is: value drops below `close_thresh` (grasp) then rises above
-    `open_thresh` (release). The detector latches the closed state until the
-    gripper opens again.
-
-    Args:
-        close_thresh: Normalised gripper value below which we consider it closed.
-        open_thresh:  Normalised gripper value above which we consider it open.
-        min_close_steps: Minimum consecutive steps below close_thresh before
-                         we declare a grasp (avoids transient noise).
+    `open_thresh` (release).
     """
 
     def __init__(self, close_thresh: float = 0.35, open_thresh: float = 0.60,
@@ -79,6 +84,10 @@ class GripperCycleDetector:
 
         return False
 
+    @property
+    def is_closed(self) -> bool:
+        return self._was_closed
+
 
 # --------------------------------------------------------------------------
 # Recovery policy
@@ -86,176 +95,322 @@ class GripperCycleDetector:
 
 @PolicyRegistry.register("lerobot_recovery")
 class RecoveryLeRobotPolicy(LeRobotPolicy):
-    """LeRobotPolicy with per-phase retry for clothes-folding tasks.
+    """LeRobotPolicy with keypoint-guided drop-recovery for clothes-folding.
 
     Phase model (top_long has 3 gripper-cycle phases):
-        Phase 0 → first sleeve fold  (left or right gripper cycle #1)
+        Phase 0 → first sleeve fold  (gripper cycle #1)
         Phase 1 → second sleeve fold (gripper cycle #2)
         Phase 2 → final body fold    (gripper cycle #3)
-        Phase 3 → done
 
-    If `phase_timeout` steps pass without the expected cycle, the policy
-    action queue is cleared and a new chunk is generated from the current
-    observation (retry). After `max_retries` failed attempts the policy
-    gives up on retrying that phase and lets execution continue naturally.
+    Recovery pipeline:
+        NORMAL → (drop detected) → DROP_DETECTED → PICKUP → REENTRY → NORMAL
+        DROP_DETECTED → (localization failed) → FALLBACK → NORMAL
 
     Args:
-        max_retries:        Max retry attempts per phase before giving up.
-        phase_timeout:      Steps per phase before declaring failure.
-        close_thresh:       Gripper value considered closed/grasping.
-        open_thresh:        Gripper value considered open/released.
-        min_close_steps:    Min consecutive close readings to register a grasp.
-        movement_threshold: Minimum L2 state change over a chunk to count as
-                            "meaningful movement" (secondary guard).
+        t_inj:              SDEdit noise injection level [0,1] (default 0.4).
+        localize_retries:   Max frames to attempt localization in DROP_DETECTED.
+        enable_recovery:    Set False to disable recovery (fallback to timeout logic).
+        close_thresh / open_thresh / min_close_steps: Gripper cycle detection params.
+        keypoint_head:      Optional pre-loaded GarmentKeypointHead. If None,
+                            drop recovery is limited to FALLBACK (full re-plan).
+        fk_solver:          Optional RobotKinematics for MPPI. If None, MPPI is
+                            skipped and only SDEdit re-entry is used after manual
+                            repositioning.
+        table_depth_mm:     Estimated table depth; auto-set on first observation.
     """
 
-    # State vector indices for the two grippers
     LEFT_GRIPPER_IDX = 5
     RIGHT_GRIPPER_IDX = 11
-    # Number of gripper-cycle phases expected for top_long folding
     NUM_PHASES = 3
 
     def __init__(
         self,
         *args,
-        max_retries: int = 3,
-        phase_timeout: int = 100,
+        t_inj: float = 0.4,
+        localize_retries: int = 3,
+        enable_recovery: bool = True,
         close_thresh: float = 0.35,
         open_thresh: float = 0.60,
         min_close_steps: int = 3,
-        movement_threshold: float = 0.25,
+        keypoint_head=None,
+        fk_solver=None,
+        table_depth_mm: float = 800.0,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
-        self.max_retries = max_retries
-        self.phase_timeout = phase_timeout
-        self.movement_threshold = movement_threshold
+        self.t_inj = t_inj
+        self.localize_retries = localize_retries
+        self.enable_recovery = enable_recovery
 
+        # Gripper cycle detectors (one per arm) — for phase tracking
         self._left_detector = GripperCycleDetector(close_thresh, open_thresh, min_close_steps)
         self._right_detector = GripperCycleDetector(close_thresh, open_thresh, min_close_steps)
 
-        # Episode-level counters (reset each episode)
+        # Episode-level state
         self._phase = 0
-        self._retry_count = 0
-        self._steps_in_phase = 0
         self._step_total = 0
+        self._garment_type: str = "top-long-sleeve"
+        self._state_machine: _State = _State.NORMAL
+        self._dropped_arm: str | None = None
+        self._localize_frame: int = 0
+        self._pickup_queue: list[np.ndarray] = []
+        self._x_failed = None  # saved last_chunk before drop
+        self._table_depth_set = False
 
-        # State snapshot at the start of the most recent planning chunk
-        self._state_at_replan: np.ndarray | None = None
-        # Step counter within the current action chunk (0…n_action_steps-1)
-        self._chunk_step = 0
-        self._n_action_steps = getattr(
-            getattr(self, "policy", None), "config", None
-        )
-        if self._n_action_steps is not None:
-            self._n_action_steps = getattr(self._n_action_steps, "n_action_steps", 16)
-        else:
-            self._n_action_steps = 16
+        # Sub-components
+        self._drop_detector = DropDetector(table_depth_mm=table_depth_mm)
+
+        self._localizer: KeypointGarmentLocalizer | None = None
+        if keypoint_head is not None:
+            backbone = self._get_backbone()
+            if backbone is not None:
+                self._localizer = KeypointGarmentLocalizer(
+                    keypoint_head=keypoint_head,
+                    backbone=backbone,
+                    table_depth_mm=table_depth_mm,
+                    device=str(self.device),
+                )
+                logger.info("[Recovery] KeypointGarmentLocalizer initialized.")
+
+        self._mppi: MPPIPickupPrimitive | None = None
+        if fk_solver is not None:
+            self._mppi = MPPIPickupPrimitive(fk_solver)
+            logger.info("[Recovery] MPPIPickupPrimitive initialized.")
+
+    def _get_backbone(self):
+        """Extract the shared ResNet18 backbone from the loaded policy."""
+        try:
+            return self.policy.model.vision_encoder.backbone
+        except AttributeError:
+            logger.warning("[Recovery] Could not extract backbone from policy.")
+            return None
 
     def reset(self):
         super().reset()
         self._left_detector.reset()
         self._right_detector.reset()
         self._phase = 0
-        self._retry_count = 0
-        self._steps_in_phase = 0
         self._step_total = 0
-        self._state_at_replan = None
-        self._chunk_step = 0
-        logger.info("RecoveryLeRobotPolicy: episode reset")
+        self._garment_type = "top-long-sleeve"
+        self._state_machine = _State.NORMAL
+        self._dropped_arm = None
+        self._localize_frame = 0
+        self._pickup_queue = []
+        self._x_failed = None
+        self._table_depth_set = False
+        self._drop_detector.reset()
+        logger.info("[Recovery] Episode reset — state=NORMAL")
+
+    # ------------------------------------------------------------------
+    # Intentional release detection (cycle-based, for DropDetector)
+    # ------------------------------------------------------------------
+
+    def _update_phase(self, state: np.ndarray) -> bool:
+        """Update gripper cycle detectors and return True if a cycle completed."""
+        left_cycle = self._left_detector.update(float(state[self.LEFT_GRIPPER_IDX]))
+        right_cycle = self._right_detector.update(float(state[self.RIGHT_GRIPPER_IDX]))
+        if left_cycle or right_cycle:
+            side = "left" if left_cycle else "right"
+            logger.info(
+                f"[Recovery] {side} gripper cycle → phase {self._phase} complete "
+                f"at step {self._step_total}"
+            )
+            self._phase = min(self._phase + 1, self.NUM_PHASES)
+            return True
+        return False
+
+    @property
+    def _intentional_release(self) -> bool:
+        """True if a gripper is in the process of an intentional release cycle."""
+        # We treat any gripper that has been detected as closed (grasping) as
+        # potentially in an intentional release — the phase tracker handles the
+        # cycle-completion signal; this flag suppresses spurious Signal A fires
+        # when the gripper opens as part of an intentional release.
+        return self._left_detector.is_closed or self._right_detector.is_closed
+
+    # ------------------------------------------------------------------
+    # State machine transitions
+    # ------------------------------------------------------------------
+
+    def _transition_drop_detected(self, observation: Dict):
+        """Handle transition to DROP_DETECTED state."""
+        self._state_machine = _State.DROP_DETECTED
+        self._localize_frame = 0
+        # Save last chunk for SDEdit
+        try:
+            self._x_failed = self.policy.policy.last_chunk
+        except AttributeError:
+            self._x_failed = None
+            logger.warning("[Recovery] Could not access last_chunk — SDEdit will full re-plan.")
+        logger.info(f"[Recovery] DROP_DETECTED: arm={self._dropped_arm}")
+
+    def _try_localize(self, observation: Dict) -> np.ndarray | None:
+        """Attempt to localize the garment grasp point."""
+        if self._localizer is None:
+            return None
+        rgb = observation.get("observation.images.top_rgb")
+        depth = observation.get("observation.top_depth")
+        if rgb is None or depth is None:
+            logger.warning("[Recovery] top_rgb or top_depth not in observation for localization.")
+            return None
+        garment_type = getattr(self, "_garment_type", "top-long-sleeve")
+        return self._localizer.localize(rgb, depth, fold_phase=self._phase, garment_type=garment_type)
+
+    def _start_pickup(self, cloth_pt: np.ndarray, state: np.ndarray):
+        """Start MPPI pickup primitive."""
+        if self._mppi is None:
+            logger.warning("[Recovery] No MPPI solver — skipping PICKUP, going to REENTRY.")
+            self._transition_reentry()
+            return
+        self._mppi.reset(state, cloth_pt, arm=self._dropped_arm or "left")
+        self._state_machine = _State.PICKUP
+        logger.info("[Recovery] PICKUP started.")
+
+    def _transition_reentry(self):
+        """Transition to REENTRY: SDEdit correct trajectory."""
+        self._state_machine = _State.REENTRY
+
+    def _transition_fallback(self):
+        """Transition to FALLBACK: full re-plan."""
+        self._state_machine = _State.FALLBACK
+        logger.warning("[Recovery] FALLBACK: full re-plan from scratch.")
+
+    # ------------------------------------------------------------------
+    # Main select_action
+    # ------------------------------------------------------------------
 
     def select_action(self, observation: Dict[str, np.ndarray]) -> np.ndarray:
-        state = observation.get("observation.state", None)
+        state = observation.get("observation.state")
+        depth = observation.get("observation.top_depth")
+        # Track garment type if provided (e.g. from env metadata or observation dict)
+        if "observation.garment_type_str" in observation:
+            self._garment_type = observation["observation.garment_type_str"]
 
         # ----------------------------------------------------------------
-        # 1. Detect gripper cycles → phase advancement
+        # Initialise table depth on first step
         # ----------------------------------------------------------------
-        if state is not None and self._phase < self.NUM_PHASES:
-            left_val = float(state[self.LEFT_GRIPPER_IDX])
-            right_val = float(state[self.RIGHT_GRIPPER_IDX])
+        if not self._table_depth_set and depth is not None:
+            self._drop_detector.set_table_depth(depth)
+            if self._localizer is not None:
+                self._localizer.table_depth_mm = self._drop_detector.table_depth_mm
+            self._table_depth_set = True
 
-            left_cycle = self._left_detector.update(left_val)
-            right_cycle = self._right_detector.update(right_val)
+        # ----------------------------------------------------------------
+        # Phase tracking (all states)
+        # ----------------------------------------------------------------
+        if state is not None:
+            self._update_phase(state)
 
-            if left_cycle or right_cycle:
-                side = "left" if left_cycle else "right"
-                logger.info(
-                    f"[Recovery] {side} gripper cycle detected → "
-                    f"phase {self._phase} complete at step {self._step_total}"
+        # ================================================================
+        # State machine
+        # ================================================================
+
+        if self._state_machine == _State.NORMAL:
+            # Check for drops
+            if self.enable_recovery and state is not None and depth is not None:
+                drop, arm = self._drop_detector.update(
+                    state, depth, intentional_release=self._intentional_release
                 )
-                self._phase += 1
-                self._retry_count = 0
-                self._steps_in_phase = 0
-                self._state_at_replan = None  # fresh snapshot on next chunk
+                if drop:
+                    self._dropped_arm = arm
+                    self._transition_drop_detected(observation)
 
-        # ----------------------------------------------------------------
-        # 2. Check for phase timeout → force retry
-        # ----------------------------------------------------------------
-        if state is not None and self._phase < self.NUM_PHASES:
-            self._steps_in_phase += 1
+            # Normal execution
+            return super().select_action(observation)
 
-            if self._steps_in_phase >= self.phase_timeout:
-                if self._retry_count < self.max_retries:
-                    self._retry_count += 1
-                    logger.warning(
-                        f"[Recovery] Phase {self._phase} timed out after "
-                        f"{self._steps_in_phase} steps "
-                        f"(retry {self._retry_count}/{self.max_retries}). "
-                        f"Forcing re-plan from current state."
-                    )
-                    # Clear the inner policy's action AND observation queues
-                    # so it generates a fresh chunk from the current observation.
-                    self.policy.reset()
-                    # Reset cycle detectors so we don't double-count
-                    self._left_detector.reset()
-                    self._right_detector.reset()
-                    self._steps_in_phase = 0
-                    self._chunk_step = 0
-                    self._state_at_replan = None
-                else:
-                    # Exhausted retries — give up and let execution continue
-                    if self._steps_in_phase == self.phase_timeout:
-                        logger.warning(
-                            f"[Recovery] Phase {self._phase} retries exhausted "
-                            f"({self.max_retries}). Continuing without retry."
-                        )
+        elif self._state_machine == _State.DROP_DETECTED:
+            self._localize_frame += 1
+            cloth_pt = self._try_localize(observation)
+            if cloth_pt is not None:
+                self._start_pickup(cloth_pt, state if state is not None else np.zeros(12))
+                # Return current (held) action while transitioning
+                return self._held_action(state)
+            if self._localize_frame >= self.localize_retries:
+                self._transition_fallback()
+                return self._do_fallback()
+            # Waiting for localization — hold current position
+            return self._held_action(state)
 
-        # ----------------------------------------------------------------
-        # 3. Snapshot state at the start of each new action chunk
-        # ----------------------------------------------------------------
-        if self._chunk_step == 0 and state is not None:
-            self._state_at_replan = state.copy()
+        elif self._state_machine == _State.PICKUP:
+            if state is None:
+                return self._held_action(state)
+            action_12, done = self._mppi.step(state)
+            if done:
+                self._transition_reentry()
+                logger.info("[Recovery] PICKUP complete → REENTRY")
+            return action_12.astype(np.float32)
 
-        # ----------------------------------------------------------------
-        # 4. Secondary guard: movement check at end of chunk
-        # ----------------------------------------------------------------
-        self._chunk_step += 1
-        if self._chunk_step >= self._n_action_steps:
-            self._chunk_step = 0  # Reset for next chunk
+        elif self._state_machine == _State.REENTRY:
+            return self._do_reentry(observation)
 
-            if (
-                state is not None
-                and self._state_at_replan is not None
-                and self._phase < self.NUM_PHASES
-                and self._retry_count < self.max_retries
-            ):
-                movement = float(np.linalg.norm(state - self._state_at_replan))
-                if movement < self.movement_threshold:
-                    self._retry_count += 1
-                    logger.warning(
-                        f"[Recovery] Minimal movement detected over last chunk "
-                        f"(L2={movement:.3f} < {self.movement_threshold}). "
-                        f"Forcing re-plan (retry {self._retry_count}/{self.max_retries})."
-                    )
-                    self.policy.reset()
-                    self._left_detector.reset()
-                    self._right_detector.reset()
-                    self._steps_in_phase = 0
-                    self._state_at_replan = None
+        elif self._state_machine == _State.FALLBACK:
+            return self._do_fallback()
 
-        self._step_total += 1
-
-        # ----------------------------------------------------------------
-        # 5. Delegate to base policy
-        # ----------------------------------------------------------------
+        # Should never reach here
         return super().select_action(observation)
+
+    # ------------------------------------------------------------------
+    # Sub-actions
+    # ------------------------------------------------------------------
+
+    def _held_action(self, state: np.ndarray | None) -> np.ndarray:
+        """Return a zero-velocity action (hold current joint positions)."""
+        if state is not None:
+            return state.astype(np.float32)
+        return np.zeros(12, dtype=np.float32)
+
+    def _do_reentry(self, observation: Dict) -> np.ndarray:
+        """Apply SDEdit and push corrected chunk, then return to NORMAL."""
+        try:
+            inner_policy = self.policy.policy  # FoldFlowPolicy
+            # Flush stale obs queues and repopulate from current observation
+            inner_policy.reset()
+            # Preprocess and populate queues with current obs
+            # (delegate to super so the queues are filled via the normal pipeline)
+            # We call select_action twice to fill n_obs_steps queues, but first
+            # just repopulate via a single forward pass without generating actions.
+            # Simplest approach: call super once to refill queues, then apply SDEdit.
+            _ = super().select_action(observation)
+
+            if self._x_failed is not None:
+                device = next(inner_policy.parameters()).device
+                x_failed = self._x_failed.to(device)
+                obs_cond = inner_policy.encode_obs_from_queues()
+                corrected = inner_policy.model.correct_trajectory(
+                    x_failed, t_inj=self.t_inj, obs_cond=obs_cond
+                )
+                # Push corrected chunk into the action queue
+                from lerobot.utils.constants import ACTION
+                inner_policy._queues[ACTION].clear()
+                start = inner_policy.config.n_obs_steps - 1
+                end = start + inner_policy.config.n_action_steps
+                chunk_slice = corrected[0, start:end]  # (n_action_steps, action_dim)
+                inner_policy._queues[ACTION].extend(chunk_slice.unbind(0))
+                logger.info("[Recovery] SDEdit re-entry: corrected chunk pushed.")
+                self._state_machine = _State.NORMAL
+                from lerobot.utils.constants import ACTION as _ACT
+                if len(inner_policy._queues[_ACT]) > 0:
+                    action = inner_policy._queues[_ACT].popleft()
+                    return action.cpu().numpy()
+            else:
+                # No saved chunk: full re-plan
+                inner_policy.reset()
+                self._state_machine = _State.NORMAL
+        except Exception as e:
+            logger.error(f"[Recovery] SDEdit re-entry failed: {e}; falling back to full re-plan.")
+            self._transition_fallback()
+            return self._do_fallback()
+
+        self._state_machine = _State.NORMAL
+        return super().select_action(observation)
+
+    def _do_fallback(self) -> np.ndarray:
+        """Full re-plan: reset inner policy and generate fresh chunk."""
+        try:
+            self.policy.reset()
+        except Exception:
+            pass
+        self._state_machine = _State.NORMAL
+        self._x_failed = None
+        logger.info("[Recovery] FALLBACK complete → NORMAL (full re-plan).")
+        return np.zeros(12, dtype=np.float32)  # one no-op step while queues refill
