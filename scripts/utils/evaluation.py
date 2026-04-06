@@ -26,8 +26,69 @@ from lehome.utils.record import (
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from .common import stabilize_garment_after_reset
 from lehome.utils.logger import get_logger
+from lehome.utils.success_checker_chanllege import get_object_particle_position
+from scipy.spatial.transform import Rotation as _ScipyRotation
 
 logger = get_logger(__name__)
+
+# 3D → 2D projection constants (top camera, matches label_keypoints.py)
+_R_w2r = np.array([[-1, 0, 0], [0, -1, 0], [0, 0, 1]], dtype=np.float32)
+_t_w2r = np.array([0.23, -0.25, 0.5], dtype=np.float32)
+_R_usd = _ScipyRotation.from_quat([-0.9862856, 0, 0, 0.1650476]).as_matrix().astype(np.float32)
+_R_opt = np.array([[1, 0, 0], [0, -1, 0], [0, 0, -1]], dtype=np.float32)
+_R_mix = _R_usd @ _R_opt
+_t_cam = np.array([0.225, -0.5, 0.6], dtype=np.float32)
+_FX = _FY = 482.0
+_CX, _CY = 320.0, 240.0
+_IMG_W, _IMG_H = 640, 480
+
+
+def _project_kp_3d_to_2d(kp_3d_cm: np.ndarray) -> np.ndarray:
+    """Project garment check_points (cm, world frame) to normalized image [0,1]."""
+    kp_3d_m = np.array(kp_3d_cm, dtype=np.float32) / 100.0
+    kp_robot = (kp_3d_m - _t_w2r) @ _R_w2r.T
+    kp_cam = (kp_robot - _t_cam) @ _R_mix
+    # Camera convention: -z is forward (matches dataset_record.py)
+    z = kp_cam[:, 2]
+    nonzero = np.abs(z) > 1e-6
+    kp_2d = np.full((len(kp_3d_m), 2), -1.0, dtype=np.float32)
+    if nonzero.any():
+        kp_2d[nonzero, 0] = (_FX * kp_cam[nonzero, 0] / z[nonzero] + _CX) / _IMG_W
+        kp_2d[nonzero, 1] = (_FY * kp_cam[nonzero, 1] / z[nonzero] + _CY) / _IMG_H
+    oob = (kp_2d[:, 0] < 0) | (kp_2d[:, 0] > 1) | (kp_2d[:, 1] < 0) | (kp_2d[:, 1] > 1)
+    kp_2d[oob] = -1.0
+    return kp_2d
+
+_GARMENT_PREFIX_TO_TYPE_IDX = {
+    "Top_Long": 0,
+    "Top_Short": 1,
+    "Pant_Long": 2,
+    "Pant_Short": 3,
+}
+
+def _garment_name_to_type_idx(garment_name: Optional[str]) -> float:
+    """Map garment name (e.g. 'Top_Long_0001') to float type index (0-3)."""
+    if garment_name:
+        for prefix, idx in _GARMENT_PREFIX_TO_TYPE_IDX.items():
+            if garment_name.startswith(prefix):
+                return float(idx)
+    return 0.0  # default: top-long-sleeve
+
+
+def _get_keypoints_2d(env) -> Optional[np.ndarray]:
+    """Read garment check_points from sim and project to normalized 2D coords.
+
+    Returns (6, 2) float32 array in [0,1], or None if unavailable.
+    """
+    try:
+        garment_obj = env.object
+        check_points = garment_obj.check_points
+        if not check_points:
+            return None
+        kp_3d_cm = get_object_particle_position(garment_obj, check_points)
+        return _project_kp_3d_to_2d(np.array(kp_3d_cm, dtype=np.float32))
+    except Exception:
+        return None
 
 
 def run_evaluation_loop(
@@ -110,6 +171,12 @@ def run_evaluation_loop(
         # 2. Initial Observation (Numpy)
         object_initial_pose = env.get_all_pose() if args.save_datasets else None
         observation_dict = env._get_observations()
+        observation_dict["observation.garment_type"] = np.array(
+            _garment_name_to_type_idx(garment_name), dtype=np.float32
+        )
+        kp_2d = _get_keypoints_2d(env)
+        if kp_2d is not None:
+            observation_dict["observation.keypoints"] = kp_2d
 
         # Prepare for video recording
         episode_frames = (
@@ -178,6 +245,12 @@ def run_evaluation_loop(
 
             # Update Observation
             observation_dict = env._get_observations()
+            observation_dict["observation.garment_type"] = np.array(
+                _garment_name_to_type_idx(garment_name), dtype=np.float32
+            )
+            kp_2d = _get_keypoints_2d(env)
+            if kp_2d is not None:
+                observation_dict["observation.keypoints"] = kp_2d
 
             # Recording
             if args.save_datasets:
@@ -276,8 +349,8 @@ def eval(args: argparse.Namespace, simulation_app: Any) -> None:
         "device": device,
     }
 
-    if args.policy_type == "lerobot":
-        # LeRobot policy requires policy_path and dataset_root
+    if args.policy_type in ("lerobot", "lerobot_recovery", "lerobot_phase_gated", "lerobot_te"):
+        # LeRobot-based policies require policy_path and dataset_root
         if not args.policy_path:
             raise ValueError("--policy_path is required for lerobot policy type")
         if not args.dataset_root:

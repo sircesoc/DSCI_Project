@@ -8,6 +8,7 @@ from typing import Dict, Optional, Tuple, Any, Union
 import gymnasium as gym
 import numpy as np
 import torch
+from scipy.spatial.transform import Rotation as R
 
 from isaacsim.simulation_app import SimulationApp
 from isaaclab.envs import DirectRLEnv
@@ -28,6 +29,13 @@ from lehome.utils.record import (
 from lehome.utils.logger import get_logger
 
 from .common import stabilize_garment_after_reset
+
+GARMENT_TYPE_TO_IDX = {
+    "top-long-sleeve": 0,
+    "top-short-sleeve": 1,
+    "long-pant": 2,
+    "short-pant": 3,
+}
 
 logger = get_logger(__name__)
 
@@ -227,6 +235,18 @@ def create_dataset_if_needed(
             "dtype": "video",
             "shape": (480, 640, 3),
             "names": ["height", "width", "channels"],
+        }
+
+    if getattr(args, "record_keypoints", False):
+        features["observation.keypoints"] = {
+            "dtype": "float32",
+            "shape": (6, 2),
+            "names": ["keypoint", "uv"],
+        }
+        features["observation.garment_type"] = {
+            "dtype": "int32",
+            "shape": (1,),
+            "names": ["type_idx"],
         }
 
     if getattr(args, "record_ee_pose", False):
@@ -456,6 +476,40 @@ def run_recording_phase(
                 print("Converting pointcloud online is time-consuming, please convert offline")
             _, truncated = env._get_dones()
             frame = {**observations, "task": args.task_description}
+
+            if getattr(args, "record_keypoints", False) and hasattr(env, "object"):
+                try:
+                    from lehome.utils.success_checker_chanllege import get_object_particle_position
+                    garment_object = env.object
+                    check_points = garment_object.check_points
+                    kp_3d_cm = get_object_particle_position(garment_object, check_points)
+                    # cm → meters, world xyz
+                    kp_3d_m = np.array(kp_3d_cm, dtype=np.float32) / 100.0  # (6, 3)
+
+                    # World → RobotBase: rot=Rz(180°), t=[0.23,-0.25,0.5]
+                    R_w2r = np.array([[-1, 0, 0], [0, -1, 0], [0, 0, 1]], dtype=np.float32)
+                    kp_robot = (kp_3d_m - np.array([0.23, -0.25, 0.5], dtype=np.float32)) @ R_w2r.T  # (6,3)
+
+                    # RobotBase → Camera
+                    R_usd = R.from_quat([-0.9862856, 0, 0, 0.1650476]).as_matrix().astype(np.float32)
+                    R_opt = np.array([[1, 0, 0], [0, -1, 0], [0, 0, -1]], dtype=np.float32)
+                    R_mix = R_usd @ R_opt  # cam_to_robot rotation
+                    kp_cam = (kp_robot - np.array([0.225, -0.5, 0.6], dtype=np.float32)) @ R_mix  # (6,3)
+
+                    # Project to normalized pixel coords
+                    u = (482.0 * kp_cam[:, 0] / kp_cam[:, 2] + 320.0) / 640.0
+                    v = (482.0 * kp_cam[:, 1] / kp_cam[:, 2] + 240.0) / 480.0
+                    kp_2d = np.stack([u, v], axis=-1).astype(np.float32)  # (6,2)
+                    frame["observation.keypoints"] = kp_2d
+                except Exception as e:
+                    logger.warning(f"[Recording] Keypoint projection failed: {e}")
+                    frame["observation.keypoints"] = np.full((6, 2), -1.0, dtype=np.float32)
+
+                garment_type_str = getattr(env, "garment_type", None)
+                if garment_type_str is None and hasattr(env, "cfg"):
+                    garment_type_str = getattr(env.cfg, "garment_type", "top-long-sleeve")
+                type_idx = GARMENT_TYPE_TO_IDX.get(garment_type_str or "top-long-sleeve", 0)
+                frame["observation.garment_type"] = np.array([type_idx], dtype=np.int32)
 
             if (
                 ee_solver is not None
