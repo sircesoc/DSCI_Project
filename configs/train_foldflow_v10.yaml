@@ -1,0 +1,99 @@
+dataset:
+  repo_id: repo_foldflow_v3
+  root: /media/sircesoc/WD_BLACK/lehome/dataset_challenge_merged/four_types_merged
+  image_transforms:
+    enable: true
+    max_num_transforms: 3
+    random_order: true
+    tfs:
+      brightness:
+        type: ColorJitter
+        weight: 1.0
+        kwargs:
+          brightness: [0.8, 1.2]
+      contrast:
+        type: ColorJitter
+        weight: 1.0
+        kwargs:
+          contrast: [0.8, 1.2]
+      affine:
+        type: RandomAffine
+        weight: 1.0
+        kwargs:
+          degrees: [-15.0, 15.0]
+          translate: [0.1, 0.1]
+          scale: [0.85, 1.15]
+
+policy:
+  type: foldflow
+  device: cuda
+  push_to_hub: false
+
+  # Garment-type conditioning
+  keypoint_cond: false
+  n_keypoints: 6
+  garment_type_cond: true
+  n_garment_types: 4
+  garment_type_emb_dim: 16
+
+  input_features:
+    observation.state:
+      type: STATE
+      shape: [12]
+    observation.garment_type:
+      type: STATE
+      shape: [1]
+    observation.images.top_rgb:
+      type: VISUAL
+      shape: [3, 480, 640]
+    observation.images.left_rgb:
+      type: VISUAL
+      shape: [3, 480, 640]
+    observation.images.right_rgb:
+      type: VISUAL
+      shape: [3, 480, 640]
+
+  output_features:
+    action:
+      type: ACTION
+      shape: [12]
+
+  n_obs_steps: 2
+  horizon: 32
+  n_action_steps: 16
+  drop_n_last_frames: 15
+
+  # Vision — DINOv2-Base, ALL layers frozen for unseen generalization
+  vision_backbone: dinov2_b
+  pretrained_backbone_weights: "facebook/dinov2-base"
+  dinov2_freeze_layers: 12
+  crop_shape: [224, 224]
+  crop_is_random: true
+  vision_feature_dim: 512
+  num_views_fusion_heads: 4
+
+  # DiT
+  dit_hidden_dim: 512
+  dit_n_heads: 8
+  dit_n_layers: 6
+  dit_ffn_dim: 2048
+  dit_dropout: 0.1
+
+  # Flow matching
+  num_flow_steps: 10
+  sigma_min: 0.0001
+
+  # Optimizer
+  optimizer_lr: 0.0001
+  optimizer_betas: [0.95, 0.999]
+  optimizer_weight_decay: 0.00001
+  scheduler_warmup_steps: 1000
+
+output_dir: outputs/train/foldflow_v10
+batch_size: 32
+steps: 300000
+save_freq: 5000
+log_freq: 500
+
+wandb:
+  enable: false
