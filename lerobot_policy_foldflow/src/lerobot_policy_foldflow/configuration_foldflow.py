@@ -54,6 +54,24 @@ class FoldFlowConfig(PreTrainedConfig):
         }
     )
 
+    # Keypoint conditioning (raw concatenation — v4b)
+    keypoint_cond: bool = False
+    n_keypoints: int = 6
+
+    # Keypoint spatial attention (bilinear sampling from backbone feature maps — v4c)
+    keypoint_spatial_cond: bool = False
+    kp_spatial_output_dim: int = 64
+
+    # Garment type conditioning
+    garment_type_cond: bool = False
+    n_garment_types: int = 4
+    garment_type_emb_dim: int = 16
+
+    # Phase conditioning (hierarchical planner — v5)
+    phase_cond: bool = False
+    n_phases: int = 3
+    phase_emb_dim: int = 16
+
     # Vision backbone
     vision_backbone: str = "resnet18"
     pretrained_backbone_weights: str | None = "IMAGENET1K_V1"
@@ -62,6 +80,7 @@ class FoldFlowConfig(PreTrainedConfig):
     crop_is_random: bool = True
     vision_feature_dim: int = 512
     num_views_fusion_heads: int = 4
+    dinov2_freeze_layers: int = 8  # number of ViT encoder layers to freeze (0=none, 12=all)
 
     # DiT transformer
     dit_hidden_dim: int = 512
@@ -72,6 +91,7 @@ class FoldFlowConfig(PreTrainedConfig):
 
     # Flow matching
     num_flow_steps: int = 10
+    eval_num_flow_steps: int | None = None  # override at inference (more steps = finer ODE)
     sigma_min: float = 1e-4
 
     # Optimizer presets
@@ -84,10 +104,6 @@ class FoldFlowConfig(PreTrainedConfig):
 
     def __post_init__(self):
         super().__post_init__()
-        if not self.vision_backbone.startswith("resnet"):
-            raise ValueError(
-                f"`vision_backbone` must be a ResNet variant. Got {self.vision_backbone}."
-            )
 
     @property
     def observation_delta_indices(self) -> list:
