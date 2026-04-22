@@ -31,6 +31,12 @@ docker/.container.cfg
 # IDE
 **/.idea/
 **/.vscode/
+
+# Local AI assistant / editor state (never publish)
+.claude/
+
+# Papers and one-off PDFs (keep out of git)
+*.pdf
 # Don't ignore the top-level .vscode directory as it is
 # used to configure VS Code settings
 !.vscode
