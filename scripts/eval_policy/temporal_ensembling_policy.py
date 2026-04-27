@@ -32,7 +32,7 @@ class TemporalEnsemblingLeRobotPolicy(LeRobotPolicy):
     predictions with exponential decay weighting (decay=0.1 by default).
     """
 
-    def __init__(self, *args, ensemble_decay: float = 0.1, replan_every: int = 4, **kwargs):
+    def __init__(self, *args, ensemble_decay: float = 0.1, replan_every: int = 2, **kwargs):
         super().__init__(*args, **kwargs)
         self.ensemble_decay = ensemble_decay
         self.replan_every = replan_every  # regenerate chunk every N steps

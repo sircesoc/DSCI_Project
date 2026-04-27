@@ -67,6 +67,10 @@ class FoldFlowConfig(PreTrainedConfig):
     n_garment_types: int = 4
     garment_type_emb_dim: int = 16
 
+    # Garment type classifier (predict type from vision at eval instead of GT)
+    garment_classifier: bool = False
+    garment_classifier_weight: float = 0.5
+
     # Phase conditioning (hierarchical planner — v5)
     phase_cond: bool = False
     n_phases: int = 3

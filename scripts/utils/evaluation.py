@@ -239,6 +239,11 @@ def run_evaluation_loop(
 
             # Accumulate reward for all steps (including post-success steps)
             episode_return += reward
+
+            # Feed reward to residual RL policy if active
+            if hasattr(policy, 'add_reward'):
+                rl_reward = reward + (10.0 if success_flag and extra_steps == 50 else 0.0)
+                policy.add_reward(rl_reward)
             # Only count length before success (for consistency with episode termination)
             if not success_flag:
                 episode_length += 1
@@ -349,7 +354,7 @@ def eval(args: argparse.Namespace, simulation_app: Any) -> None:
         "device": device,
     }
 
-    if args.policy_type in ("lerobot", "lerobot_recovery", "lerobot_phase_gated", "lerobot_te"):
+    if args.policy_type in ("lerobot", "lerobot_recovery", "lerobot_phase_gated", "lerobot_te", "lerobot_te_ms", "lerobot_ate", "lerobot_vlm", "lerobot_rrl"):
         # LeRobot-based policies require policy_path and dataset_root
         if not args.policy_path:
             raise ValueError("--policy_path is required for lerobot policy type")

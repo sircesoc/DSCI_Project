@@ -13,6 +13,10 @@ from .lerobot_policy import LeRobotPolicy
 from .recovery_lerobot_policy import RecoveryLeRobotPolicy
 from .phase_gated_policy import PhaseGatedLeRobotPolicy
 from .temporal_ensembling_policy import TemporalEnsemblingLeRobotPolicy
+from .te_multiseed_policy import TEMultiSeedLeRobotPolicy
+from .adaptive_te_policy import AdaptiveTELeRobotPolicy
+from .vlm_verified_policy import VLMVerifiedLeRobotPolicy
+from .residual_rl_policy import ResidualRLPolicy
 from .example_participant_policy import CustomPolicy
 
 __all__ = [
@@ -22,5 +26,6 @@ __all__ = [
     "RecoveryLeRobotPolicy",
     "PhaseGatedLeRobotPolicy",
     "TemporalEnsemblingLeRobotPolicy",
+    "TEMultiSeedLeRobotPolicy",
     "CustomPolicy",
 ]

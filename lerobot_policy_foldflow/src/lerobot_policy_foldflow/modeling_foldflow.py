@@ -233,7 +233,7 @@ class MultiViewClothEncoder(nn.Module):
             self.backbone = dino
             self._backbone_type = "dinov2"
             backbone_out_channels = dino.config.hidden_size  # 768 for ViT-B, 384 for ViT-S
-            self.vit_proj = nn.Linear(backbone_out_channels, config.vision_feature_dim)
+            self.dino_proj = nn.Linear(backbone_out_channels, config.vision_feature_dim)
         else:
             # ResNet backbone (strip FC and avgpool)
             backbone_model = getattr(torchvision.models, config.vision_backbone)(
@@ -297,7 +297,7 @@ class MultiViewClothEncoder(nn.Module):
         elif self._backbone_type == "dinov2":
             out = self.backbone(pixel_values=x)
             patch_tokens = out.last_hidden_state[:, 1:, :]  # drop CLS → (B*S*V, N, D)
-            pooled = self.vit_proj(patch_tokens.mean(dim=1))  # (B*S*V, D)
+            pooled = self.dino_proj(patch_tokens.mean(dim=1))  # (B*S*V, D)
             feat_map = None
         else:
             feat_map = self.backbone(x)  # (B*S*V, C_out, H', W')
@@ -560,6 +560,22 @@ class GarmentKeypointHead(nn.Module):
         return coords, heatmaps
 
 
+class GarmentTypeClassifier(nn.Module):
+    """Lightweight classifier predicting garment type from vision features."""
+
+    def __init__(self, in_dim: int, n_types: int):
+        super().__init__()
+        self.head = nn.Sequential(
+            nn.Linear(in_dim, 128),
+            nn.ReLU(),
+            nn.Linear(128, n_types),
+        )
+
+    def forward(self, vis_feat: Tensor) -> Tensor:
+        """Args: vis_feat (B, D) pooled vision features. Returns: (B, n_types) logits."""
+        return self.head(vis_feat)
+
+
 # ---------------------------------------------------------------------------
 # Flow Matching model
 # ---------------------------------------------------------------------------
@@ -593,11 +609,21 @@ class FoldFlowModel(nn.Module):
         if config.garment_type_cond:
             self.garment_type_emb = nn.Embedding(config.n_garment_types, config.garment_type_emb_dim)
             obs_cond_dim += config.garment_type_emb_dim
+        # Garment type classifier: predict type from vision at eval
+        self.garment_classifier = None
+        if config.garment_classifier and config.garment_type_cond:
+            cls_in_dim = config.n_obs_steps * n_views * config.vision_feature_dim
+            self.garment_classifier = GarmentTypeClassifier(cls_in_dim, config.n_garment_types)
         if config.phase_cond:
             self.phase_emb = nn.Embedding(config.n_phases, config.phase_emb_dim)
             obs_cond_dim += config.phase_emb_dim
 
         self.dit = FoldFlowDiT(config, obs_cond_dim=obs_cond_dim, action_dim=action_dim)
+        self._cached_gtype = None  # cached classifier prediction (cleared on episode reset)
+
+    def clear_garment_cache(self):
+        """Clear cached garment type prediction. Call on episode reset."""
+        self._cached_gtype = None
 
     def _encode_obs(self, batch: dict[str, Tensor]) -> Tensor:
         """Encode vision and state observations into a flat conditioning vector.
@@ -618,6 +644,7 @@ class FoldFlowModel(nn.Module):
         kp_uv = batch.get("observation.keypoints") if self.config.keypoint_spatial_cond else None
         vis_feat = self.vision_encoder(batch[OBS_IMAGES], kp_uv=kp_uv)  # (B, S, V*D [+ kp])
         vis_feat = vis_feat.reshape(B, -1)  # (B, S*V*D)
+        self._last_vis_feat = vis_feat  # stored for classifier loss in compute_loss
         state_feat = batch[OBS_STATE].reshape(B, -1)  # (B, S*state_dim)
         parts = [vis_feat, state_feat]
 
@@ -630,16 +657,25 @@ class FoldFlowModel(nn.Module):
             parts.append(kp)
 
         if self.config.garment_type_cond:
-            if "observation.garment_type" in batch:
-                # Stored as MIN_MAX-normalized float in [0,1]; reverse to integer index.
-                # Shape is (B, S) for scalar storage or (B, S, 1) for sequence storage.
-                gt = batch["observation.garment_type"]
-                gtype_norm = gt[:, 0, 0] if gt.dim() == 3 else gt[:, 0]  # (B,)
-                gtype = torch.round(
-                    gtype_norm * (self.config.n_garment_types - 1)
-                ).long().clamp(0, self.config.n_garment_types - 1)
+            if self.garment_classifier is not None and not self.training:
+                # Eval: predict garment type from vision features (once per episode)
+                if self._cached_gtype is None:
+                    gtype_logits = self.garment_classifier(vis_feat)
+                    self._cached_gtype = gtype_logits.argmax(dim=-1)  # (B,)
+                gtype = self._cached_gtype
             else:
-                gtype = torch.zeros(B, dtype=torch.long, device=device)
+                # Training (or no classifier): use ground-truth label
+                if "observation.garment_type" in batch:
+                    # Stored as MIN_MAX-normalized float in [0,1]; reverse to integer index.
+                    # Shape is (B, S) for scalar storage or (B, S, 1) for sequence storage.
+                    gt = batch["observation.garment_type"]
+                    gtype_norm = gt[:, 0, 0] if gt.dim() == 3 else gt[:, 0]  # (B,)
+                    gtype = torch.round(
+                        gtype_norm * (self.config.n_garment_types - 1)
+                    ).long().clamp(0, self.config.n_garment_types - 1)
+                else:
+                    gtype = torch.zeros(B, dtype=torch.long, device=device)
+                self._last_gtype_gt = gtype  # stored for classifier loss
             parts.append(self.garment_type_emb(gtype))  # (B, emb_dim)
 
         if self.config.phase_cond:
@@ -702,7 +738,15 @@ class FoldFlowModel(nn.Module):
             aw = aw[:, -1, 0] if aw.dim() == 3 else aw[:, 0]  # (B,)
             loss = loss * aw.reshape(B, 1, 1)
 
-        return loss.mean()
+        cfm_loss = loss.mean()
+
+        # Garment type classifier auxiliary loss
+        if self.garment_classifier is not None and self.training:
+            gtype_logits = self.garment_classifier(self._last_vis_feat.detach())
+            cls_loss = F.cross_entropy(gtype_logits, self._last_gtype_gt)
+            return cfm_loss + self.config.garment_classifier_weight * cls_loss
+
+        return cfm_loss
 
     @torch.no_grad()
     def correct_trajectory(self, x_failed: Tensor, t_inj: float, obs_cond: Tensor) -> Tensor:
@@ -729,6 +773,8 @@ class FoldFlowModel(nn.Module):
 
         return x_t
 
+    _inference_times: list[float] = []
+
     @torch.no_grad()
     def generate_actions(self, batch: dict[str, Tensor]) -> Tensor:
         """Euler ODE integration from noise (t=1) to clean actions (t=0).
@@ -739,6 +785,8 @@ class FoldFlowModel(nn.Module):
         Returns:
             (B, n_action_steps, action_dim) action chunk.
         """
+        import time
+
         device = get_device_from_parameters(self)
         dtype = get_dtype_from_parameters(self)
 
@@ -746,6 +794,11 @@ class FoldFlowModel(nn.Module):
         assert n_obs_steps == self.config.n_obs_steps
 
         action_dim = self.config.action_feature.shape[0]
+
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        t_start = time.perf_counter()
+
         obs_cond = self._encode_obs(batch)
 
         # Start from pure noise at t=1
@@ -757,6 +810,22 @@ class FoldFlowModel(nn.Module):
             t_tensor = torch.full((B,), t_val, device=device, dtype=dtype)
             v = self.dit(x_t, t_tensor, obs_cond)
             x_t = x_t - v * (1.0 / N)  # Euler step toward t=0
+
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        elapsed_ms = (time.perf_counter() - t_start) * 1000.0
+
+        self._inference_times.append(elapsed_ms)
+        if len(self._inference_times) % 50 == 0:
+            times = self._inference_times
+            avg = sum(times) / len(times)
+            p50 = sorted(times)[len(times) // 2]
+            p95 = sorted(times)[int(len(times) * 0.95)]
+            print(
+                f"[FoldFlow inference] n={len(times)} | "
+                f"mean={avg:.1f}ms  p50={p50:.1f}ms  p95={p95:.1f}ms  "
+                f"last={elapsed_ms:.1f}ms  ({1000/avg:.0f} Hz)"
+            )
 
         # Return only the n_action_steps relevant to the current time step
         start = self.config.n_obs_steps - 1
@@ -792,6 +861,7 @@ class FoldFlowPolicy(PreTrainedPolicy):
 
     def reset(self):
         """Clear observation and action queues. Call on env.reset()."""
+        self.model.clear_garment_cache()
         self._queues = {
             OBS_STATE: deque(maxlen=self.config.n_obs_steps),
             ACTION: deque(maxlen=self.config.n_action_steps),
